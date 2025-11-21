@@ -14,6 +14,8 @@ if __name__ == "__main__":
     # or you can use a local path like:
     # ckpt_path = "./ckpt/sam_med3d_turbo.pth"
 
+    ckpt_path = "./sam_med3d_turbo.pth"
+
     test_data_list = [
         dict(
             img_dir="./data/ct_AMOS/imagesVal",
