@@ -173,3 +173,6 @@ cython_debug/
 
 # ckpt for sam-med3d
 sam_med3d_turbo.pth
+
+# masks created
+data/

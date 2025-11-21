@@ -14,14 +14,12 @@ if __name__ == "__main__":
     # or you can use a local path like:
     # ckpt_path = "./ckpt/sam_med3d_turbo.pth"
 
-    ckpt_path = "./sam_med3d_turbo.pth"
-
     test_data_list = [
         dict(
-            img_dir="./data/ct_AMOS/imagesVal",
-            gt_dir="./data/ct_AMOS/labelsVal",
+            img_dir="/data/ibd/data/RAOS/RAOS-Real/CancerImages(Set1)/imagesTr",
+            gt_dir="/data/ibd/data/RAOS/RAOS-Real/CancerImages(Set1)/labelsTr_intestinal_tract",
             out_dir="./data/ct_AMOS/pred_sammed3d",
-            ckpt_path="./ckpt/sam_med3d_turbo.pth",
+            ckpt_path="./sam_med3d_turbo.pth",
         ),
     ]
     for test_data in test_data_list:
