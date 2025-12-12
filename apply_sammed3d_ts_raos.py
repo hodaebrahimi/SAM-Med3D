@@ -11,39 +11,36 @@ import numpy as np
 
 from utils.infer_utils_hoda import validate_paired_img_gt_with_ts_clicks
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 
 
 if __name__ == "__main__":
     ''' 
-    IMPROVED SAM-Med3D INFERENCE:
+    SAM-Med3D with Center-of-Mass Point Prompts from TotalSegmentator/Vista
     
-    Key improvements:
-    1. Proper coordinate conversion (z,y,x) → (x,y,z) for SAM
-    2. Bounding box prompts in addition to point clicks
-    3. Optional iterative refinement
-    4. More positive clicks for complex anatomy
+    Strategy:
+    1. Load TotalSegmentator/Vista mask as guidance
+    2. For each slice with mask content, compute center of mass -> point prompt
+    3. Sample additional points from foreground if needed to reach ~50 points
+    4. Generate negative points from boundary zone
+    5. Feed all points to SAM-Med3D for segmentation
+    
+    This mimics MedSAM2's slice selection but uses point prompts instead of masks.
     '''
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
     # ============================================================================
-    # IMPROVED CONFIGURATION - BASED ON DIAGNOSTICS
+    # CONFIGURATION
     # ============================================================================
     
-    # Problem: Model only supports 128³ input size (trained at this resolution)
-    # Strategy: Keep 128³ but maximize clicks and no erosion
-    
-    NUM_POSITIVE_CLICKS = 50   # Maximum guidance with many clicks
-    NUM_NEGATIVE_CLICKS = 20   # Strong boundary definition
-    USE_BOX_PROMPT = False     
-    NUM_ITERATIONS = 3         # Multiple refinement passes
-    EROSION_ITERATIONS = 0     # NO erosion - use full TS mask
-    CROP_SIZE = 128            # Must use 128 (model limitation)
-    
-    # The 128³ crop might cut off anatomy, but it's a model limitation
-    # We compensate with many clicks and iterative refinement
+    NUM_POSITIVE_TARGET = 50   # Target number of positive clicks (center-of-mass + random)
+    NUM_NEGATIVE = 20          # Negative clicks from boundary zone
+    STRIDE = 1                 # Sample every Nth slice (1 = every slice with content)
+    EROSION_ITERATIONS = 0     # Erosion before extracting centers (0 = use full mask)
+    CROP_SIZE = 128            # Must use 128³ (SAM-Med3D limitation)
+    BOUNDARY_DILATION = 5      # Pixels to dilate for negative sampling zone
     
     # ============================================================================
     
@@ -51,26 +48,29 @@ if __name__ == "__main__":
         dict(
             img_dir="/data/ibd/data/RAOS/RAOS-Real/CancerImages(Set1)/imagesTr",
             gt_dir="/data/ibd/data/RAOS/RAOS-Real/CancerImages(Set1)/labelsTr_intestinal_tract",
-            ts_dir="/data/ibd/data/RAOS/raos_tr_totalseg_labels",
-            out_dir="./data/raos_pred_sammed3d_improved",
+            ts_dir="/data/ibd/data/RAOS/raos_tr_totalseg_labels",  # or raos_tr_vista_labels
+            out_dir="./data/raos_pred_sammed3d_com_prompts",
             ckpt_path="./sam_med3d_turbo.pth",
         ),
     ]
     
     print("\n" + "="*80)
-    print("IMPROVED SAM-Med3D CONFIGURATION:")
+    print("SAM-Med3D with CENTER-OF-MASS POINT PROMPTS")
     print("="*80)
-    print(f"Positive Clicks: {NUM_POSITIVE_CLICKS}")
-    print(f"Negative Clicks: {NUM_NEGATIVE_CLICKS}")
-    print(f"Use Bounding Box: {USE_BOX_PROMPT} (disabled - SAM-Med3D box format issues)")
-    print(f"Refinement Iterations: {NUM_ITERATIONS}")
-    print(f"Erosion Iterations: {EROSION_ITERATIONS}")
-    print(f"ROI Crop Size: {CROP_SIZE}³ (model limitation - trained at 128³)")
-    print(f"Total prompts: {NUM_POSITIVE_CLICKS + NUM_NEGATIVE_CLICKS} point clicks")
-    print(f"Key fix: Coordinates converted from (z,y,x) to (x,y,z) for SAM")
-    print(f"\nDiagnostic findings: Severe under-segmentation (Recall: 0.27)")
-    print(f"Strategy: Maximum clicks + No erosion + 3x refinement")
-    print(f"Note: 128³ crop is a model limitation, may cut off large anatomy")
+    print(f"Target Positive Clicks: {NUM_POSITIVE_TARGET}")
+    print(f"  - Center-of-mass per slice with content")
+    print(f"  - Additional random foreground samples if needed")
+    print(f"Negative Clicks: {NUM_NEGATIVE} (from boundary zone)")
+    print(f"Slice Stride: {STRIDE} (1 = every slice with TS content)")
+    print(f"Erosion Iterations: {EROSION_ITERATIONS} (0 = no erosion)")
+    print(f"ROI Crop Size: {CROP_SIZE}³ (model limitation)")
+    print(f"Boundary Dilation: {BOUNDARY_DILATION} pixels")
+    print(f"\nStrategy:")
+    print(f"  1. Identify slices with TotalSegmentator/Vista content")
+    print(f"  2. Compute center-of-mass in each slice -> positive points")
+    print(f"  3. Sample additional foreground points if <{NUM_POSITIVE_TARGET}")
+    print(f"  4. Sample negative points from dilated boundary zone")
+    print(f"  5. Feed all {NUM_POSITIVE_TARGET + NUM_NEGATIVE} points to SAM-Med3D")
     print("="*80 + "\n")
     
     for test_data in test_data_list:
@@ -104,18 +104,21 @@ if __name__ == "__main__":
                 continue
             
             try:
+                print(f"\n{'='*60}")
+                print(f"Processing: {case_name}")
+                print(f"{'='*60}")
+                
                 dice_score = validate_paired_img_gt_with_ts_clicks(
                     model=model,
                     img_path=img_path,
                     gt_path=gt_path,
                     ts_path=ts_path,
                     output_path=out_path,
-                    num_positive_clicks=NUM_POSITIVE_CLICKS,
-                    num_negative_clicks=NUM_NEGATIVE_CLICKS,
-                    use_box_prompt=USE_BOX_PROMPT,
-                    num_iterations=NUM_ITERATIONS,
+                    num_positive_target=NUM_POSITIVE_TARGET,
+                    num_negative=NUM_NEGATIVE,
+                    stride=STRIDE,
                     erosion_iterations=EROSION_ITERATIONS,
-                    crop_size=CROP_SIZE,  # Use larger crop size
+                    crop_size=CROP_SIZE,
                     target_spacing=(1.5, 1.5, 1.5),
                     seed=233,
                     device=device
@@ -147,26 +150,34 @@ if __name__ == "__main__":
             for label, count in zip(bin_labels, hist):
                 pct = 100 * count / len(dice_scores)
                 print(f"  {label}: {count} cases ({pct:.1f}%)")
+                bar = "█" * int(pct / 2)
+                print(f"    {bar}")
         
-        print(f"\n✅ Complete! Results in {test_data['out_dir']}")
+        print(f"\n✅ Complete! Results saved to {test_data['out_dir']}")
 
 
+# ============================================================================
 # TROUBLESHOOTING GUIDE:
-#
-# If Dice is still low (< 0.5):
-# 1. Try MORE positive clicks (30-40) - bowel is very complex
-# 2. Try NUM_ITERATIONS = 2 or 3 for refinement
-# 3. Reduce EROSION_ITERATIONS to 1 for more coverage
-# 4. Check TotalSegmentator mask quality visually
-#
-# If over-segmenting (including too much):
-# 1. Increase EROSION_ITERATIONS (3-4)
-# 2. Add more negative clicks (10-15)
-# 3. Reduce positive clicks (12-15)
+# ============================================================================
 #
 # If under-segmenting (missing regions):
-# 1. Increase positive clicks (30-40)
-# 2. Reduce EROSION_ITERATIONS (1)
-# 3. Try NUM_ITERATIONS = 2-3
+# 1. Set EROSION_ITERATIONS = 0 (use full TS mask)
+# 2. Increase STRIDE to get more slices (try stride=1)
+# 3. Increase NUM_POSITIVE_TARGET to 70-100
+# 4. Check if TS mask has good coverage
 #
-# Box prompts are DISABLED - SAM-Med3D has format incompatibility issues
+# If over-segmenting (including too much):
+# 1. Set EROSION_ITERATIONS = 2-3 (more conservative centers)
+# 2. Increase NUM_NEGATIVE to 30-40
+# 3. Reduce BOUNDARY_DILATION to 3
+# 4. Try STRIDE = 2 (fewer positive prompts)
+#
+# If results are similar to previous approach:
+# - The issue may be SAM-Med3D's 128³ limitation cutting off anatomy
+# - Compare with MedSAM2 which uses full-resolution propagation
+# - Consider using larger patch size if model supports it
+#
+# Expected behavior:
+# - Should generate ~50 positive points distributed along organ
+# - Should see printout showing: "Found N slices with mask content"
+# - Points should be in (Z, Y, X) coordinate order

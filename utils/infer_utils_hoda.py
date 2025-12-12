@@ -1,6 +1,3 @@
-# Based on the original SAM-Med3D code that works
-# Key insight: Keep coordinates in (Z, Y, X) order, not (X, Y, Z)!
-
 import copy
 import os
 import os.path as osp
@@ -20,81 +17,213 @@ def binary_erosion(mask, iterations=2):
     return eroded_mask.astype(mask.dtype)
 
 
-def generate_gt_based_clicks_simple(gt_mask, num_positive, num_negative, seed=None):
+def generate_center_of_mass_clicks(
+    ts_mask, 
+    num_positive_target=50, 
+    num_negative=20,
+    stride=1,
+    erosion_iterations=0,
+    boundary_dilation=5,
+    seed=None
+):
     """
-    Generate clicks directly from GT mask (for testing SAM's capability).
-    Uses simple random sampling - no EDT.
-    Coordinates stay in (Z, Y, X) order as SAM-Med3D expects!
+    Generate point prompts by finding center of mass in each slice with mask content.
+    
+    Strategy:
+    1. Identify slices with non-zero mask pixels (like MedSAM2)
+    2. For each slice, compute center of mass -> positive click
+    3. Sample additional positive clicks from high-confidence regions if needed
+    4. Generate negative clicks from dilated boundary or background
+    
+    Args:
+        ts_mask: (D, H, W) or (H, W, D) binary mask from TotalSegmentator/Vista
+        num_positive_target: Target number of positive clicks (~50)
+        num_negative: Number of negative clicks
+        stride: Slice sampling stride (1 = every slice with content)
+        erosion_iterations: Erode mask before extracting centers
+        boundary_dilation: Pixels to dilate for negative sampling zone
+        seed: Random seed
+        
+    Returns:
+        points_coords: (1, N, 3) tensor in (Z, Y, X) order
+        points_labels: (1, N) tensor with 1=positive, 0=negative
     """
     if seed is not None:
         np.random.seed(seed)
-        torch.manual_seed(seed)
     
-    if gt_mask.ndim != 3:
-        gt_mask = gt_mask.squeeze()
+    # Ensure 3D
+    if ts_mask.ndim != 3:
+        ts_mask = ts_mask.squeeze()
     
-    gt_binary = gt_mask > 0
+    # Optional erosion to make prompts more conservative
+    if erosion_iterations > 0:
+        ts_mask = binary_erosion(ts_mask, iterations=erosion_iterations)
+    
+    ts_binary = ts_mask > 0
+    D, H, W = ts_binary.shape
+    
     points_list = []
     labels_list = []
     
-    # Positive clicks from foreground
-    if num_positive > 0:
-        fg_points = torch.argwhere(gt_binary).cpu().numpy()
-        if len(fg_points) > 0:
-            indices = np.random.choice(len(fg_points), min(num_positive, len(fg_points)), replace=False)
-            for idx in indices:
-                # Keep in (Z, Y, X) order - don't convert!
-                points_list.append(fg_points[idx])
-                labels_list.append(1)
+    # ========================================================================
+    # POSITIVE CLICKS: Center of mass per slice
+    # ========================================================================
     
-    # Negative clicks from background
-    if num_negative > 0:
-        bg_points = torch.argwhere(~gt_binary).cpu().numpy()
-        if len(bg_points) > 0:
-            indices = np.random.choice(len(bg_points), min(num_negative, len(bg_points)), replace=False)
+    # Find slices with content (same as MedSAM2 seed selection)
+    slice_has_content = ts_binary.sum(axis=(1, 2)) > 0
+    valid_slice_indices = np.where(slice_has_content)[0][::stride]
+    
+    print(f"   Found {len(valid_slice_indices)} slices with mask content (stride={stride})")
+    
+    # Compute center of mass for each valid slice
+    for z_idx in valid_slice_indices:
+        slice_mask = ts_binary[z_idx, :, :]
+        
+        if slice_mask.sum() == 0:
+            continue
+        
+        # Compute center of mass in this slice
+        y_coords, x_coords = np.where(slice_mask)
+        center_y = int(np.mean(y_coords))
+        center_x = int(np.mean(x_coords))
+        
+        # Store as (Z, Y, X) - SAM-Med3D format
+        points_list.append([z_idx, center_y, center_x])
+        labels_list.append(1)
+    
+    num_com_clicks = len(points_list)
+    print(f"   Generated {num_com_clicks} center-of-mass clicks")
+    
+    # ========================================================================
+    # ADDITIONAL POSITIVE CLICKS: Sample randomly from foreground if needed
+    # ========================================================================
+    
+    if num_com_clicks < num_positive_target:
+        num_additional = num_positive_target - num_com_clicks
+        
+        # Get all foreground voxels
+        fg_coords = np.argwhere(ts_binary)  # (N, 3) in (Z, Y, X)
+        
+        if len(fg_coords) > 0:
+            # Sample additional points randomly
+            num_sample = min(num_additional, len(fg_coords))
+            indices = np.random.choice(len(fg_coords), num_sample, replace=False)
+            
             for idx in indices:
-                # Keep in (Z, Y, X) order - don't convert!
-                points_list.append(bg_points[idx])
+                points_list.append(fg_coords[idx])
+                labels_list.append(1)
+            
+            print(f"   Added {num_sample} additional random foreground clicks")
+    
+    # ========================================================================
+    # NEGATIVE CLICKS: Sample from boundary zone or background
+    # ========================================================================
+    
+    if num_negative > 0:
+        # Create boundary zone: dilate mask and subtract original
+        if boundary_dilation > 0:
+            struct = ndi.generate_binary_structure(3, 1)
+            dilated_mask = ndi.binary_dilation(
+                ts_binary, 
+                structure=struct, 
+                iterations=boundary_dilation
+            )
+            boundary_zone = dilated_mask & ~ts_binary
+        else:
+            # Just use background
+            boundary_zone = ~ts_binary
+        
+        bg_coords = np.argwhere(boundary_zone)
+        
+        if len(bg_coords) > 0:
+            num_sample = min(num_negative, len(bg_coords))
+            indices = np.random.choice(len(bg_coords), num_sample, replace=False)
+            
+            for idx in indices:
+                points_list.append(bg_coords[idx])
                 labels_list.append(0)
+            
+            print(f"   Generated {num_sample} negative clicks from boundary zone")
+        else:
+            print(f"   Warning: No boundary zone found for negative clicks")
+    
+    # ========================================================================
+    # Convert to tensors
+    # ========================================================================
     
     if len(points_list) == 0:
+        print("   Warning: No clicks generated!")
         return torch.zeros(1, 0, 3), torch.zeros(1, 0, dtype=torch.long)
     
     # Stack as (Z, Y, X) - DO NOT REORDER
     points_coords = torch.tensor(np.array(points_list), dtype=torch.float32).unsqueeze(0)
     points_labels = torch.tensor(labels_list, dtype=torch.long).unsqueeze(0)
     
+    total_pos = (points_labels == 1).sum().item()
+    total_neg = (points_labels == 0).sum().item()
+    print(f"   Total prompts: {total_pos} positive + {total_neg} negative = {total_pos + total_neg}")
+    
     return points_coords, points_labels
 
 
-def sam_model_infer_simple(model, roi_image, roi_gt, num_positive=10, num_negative=5, 
-                          seed=None, device=None):
-    """Simplified inference - all clicks at once, based directly on GT"""
+def sam_model_infer_with_ts_clicks(
+    model, 
+    roi_image, 
+    roi_ts_mask,
+    num_positive_target=50,
+    num_negative=20,
+    stride=1,
+    erosion_iterations=0,
+    seed=None, 
+    device=None
+):
+    """
+    Inference using center-of-mass clicks from TotalSegmentator/Vista mask.
+    
+    Args:
+        model: SAM-Med3D model
+        roi_image: (1, 1, D, H, W) preprocessed CT image
+        roi_ts_mask: (1, 1, D, H, W) preprocessed TS mask
+        num_positive_target: Target number of positive clicks
+        num_negative: Number of negative clicks
+        stride: Slice sampling stride
+        erosion_iterations: Erosion before extracting centers
+        seed: Random seed
+        device: Torch device
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     model.eval()
     
-    if roi_gt is not None and (roi_gt == 0).all():
-        print("Warning: Empty GT mask")
+    # Check if mask is empty
+    if roi_ts_mask is not None and (roi_ts_mask == 0).all():
+        print("   Warning: Empty TS mask")
         return np.zeros_like(roi_image.cpu().numpy().squeeze()), None
     
     with torch.no_grad():
+        # Get image embeddings
         input_tensor = roi_image.to(device)
         image_embeddings = model.image_encoder(input_tensor)
         
-        # Generate all clicks from GT
-        points_coords, points_labels = generate_gt_based_clicks_simple(
-            roi_gt[0, 0],
-            num_positive=num_positive,
+        # Generate clicks from TS mask
+        ts_mask_np = roi_ts_mask[0, 0].cpu().numpy()  # (D, H, W)
+        
+        points_coords, points_labels = generate_center_of_mass_clicks(
+            ts_mask_np,
+            num_positive_target=num_positive_target,
             num_negative=num_negative,
+            stride=stride,
+            erosion_iterations=erosion_iterations,
             seed=seed
         )
         
+        if points_coords.shape[1] == 0:
+            print("   No valid clicks generated, returning empty mask")
+            return np.zeros_like(roi_image.cpu().numpy().squeeze()), None
+        
         points_coords = points_coords.to(device)
         points_labels = points_labels.to(device)
-        
-        print(f"      Generated {(points_labels==1).sum().item()} pos + {(points_labels==0).sum().item()} neg clicks")
         
         # Initialize mask input
         prev_low_res_mask = torch.zeros(
@@ -134,7 +263,10 @@ def sam_model_infer_simple(model, roi_image, roi_gt, num_positive=10, num_negati
     return medsam_seg_mask, low_res_masks.detach()
 
 
-# Keep all the helper functions from original code
+# ============================================================================
+# Helper functions (unchanged from original)
+# ============================================================================
+
 def read_arr_from_nifti(nii_path, get_meta_info=False):
     sitk_image = sitk.ReadImage(nii_path)
     arr = sitk.GetArrayFromImage(sitk_image)
@@ -253,30 +385,55 @@ def compute_dice(pred, gt):
     return 2.0 * intersection / union
 
 
-def validate_with_gt_clicks(model, img_path, gt_path, output_path,
-                            num_positive=10, num_negative=5,
-                            crop_size=128, target_spacing=(1.5, 1.5, 1.5), 
-                            seed=233, device=None):
+def validate_paired_img_gt_with_ts_clicks(
+    model, 
+    img_path, 
+    gt_path,
+    ts_path,
+    output_path,
+    num_positive_target=50,
+    num_negative=20,
+    stride=1,
+    erosion_iterations=0,
+    crop_size=128, 
+    target_spacing=(1.5, 1.5, 1.5), 
+    seed=233, 
+    device=None
+):
     """
-    TEST VERSION: Use real GT for click generation to see SAM's true capability
-    This isolates whether the problem is SAM or the TS mask quality
+    Main validation function using TotalSegmentator mask for click generation.
+    
+    Args:
+        model: SAM-Med3D model
+        img_path: Path to CT image
+        gt_path: Path to ground truth (for evaluation only)
+        ts_path: Path to TotalSegmentator/Vista mask (for click generation)
+        output_path: Where to save prediction
+        num_positive_target: Target number of positive clicks (~50)
+        num_negative: Number of negative clicks
+        stride: Slice sampling stride (1 = every slice)
+        erosion_iterations: Erosion before extracting centers (0 = no erosion)
+        crop_size: ROI crop size (must be 128 for SAM-Med3D)
+        target_spacing: Target voxel spacing
+        seed: Random seed
+        device: Torch device
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
     
     os.makedirs(osp.dirname(output_path), exist_ok=True)
     
-    # Load GT
+    # Load GT for evaluation
     gt_arr = read_arr_from_nifti(gt_path)
     _, gt_meta_for_saving = read_arr_from_nifti(gt_path, get_meta_info=True)
     gt_arr_binary = (gt_arr > 0).astype(np.uint8)
     
-    # Preprocess with REAL GT
-    subject, meta_info = get_subject_and_meta_info(img_path, gt_path)
+    # Preprocess IMAGE with TS mask
+    subject, meta_info = get_subject_and_meta_info(img_path, ts_path)
     subject_copy = copy.deepcopy(subject)
     meta_info_copy = copy.deepcopy(meta_info)
     
-    roi_image, roi_gt, meta_info_processed = data_preprocess(
+    roi_image, roi_ts_mask, meta_info_processed = data_preprocess(
         subject_copy,
         meta_info_copy,
         category_index=1,
@@ -284,15 +441,17 @@ def validate_with_gt_clicks(model, img_path, gt_path, output_path,
         crop_size=crop_size
     )
     
-    print(f"   ROI GT voxels: {(roi_gt > 0).sum().item()}")
+    print(f"   ROI TS mask voxels: {(roi_ts_mask > 0).sum().item()}")
     
-    # Run inference with GT-based clicks
-    roi_pred_numpy, _ = sam_model_infer_simple(
+    # Run inference with TS-based clicks
+    roi_pred_numpy, _ = sam_model_infer_with_ts_clicks(
         model, 
         roi_image, 
-        roi_gt=roi_gt,
-        num_positive=num_positive,
+        roi_ts_mask=roi_ts_mask,
+        num_positive_target=num_positive_target,
         num_negative=num_negative,
+        stride=stride,
+        erosion_iterations=erosion_iterations,
         seed=seed,
         device=device
     )
@@ -306,6 +465,6 @@ def validate_with_gt_clicks(model, img_path, gt_path, output_path,
     
     # Compute dice
     dice_score = compute_dice(final_pred_binary, gt_arr_binary)
-    print(f"✅ Dice (using GT clicks): {dice_score:.4f}\n")
+    print(f"✅ Dice (using TS center-of-mass clicks): {dice_score:.4f}\n")
     
     return dice_score
